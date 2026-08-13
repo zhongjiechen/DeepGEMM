@@ -72,6 +72,71 @@ def _copy_fp8_sf(dst: torch.Tensor, src: torch.Tensor, num_tokens: int) -> None:
 
 # TODO: skip the test for SM90
 # noinspection PyUnboundLocalVariable,PyShadowingNames
+def _baseline_time_from_trace(trace_path: str, rank_idx: int) -> float:
+    """Per-iteration GPU span of the non-fused baseline, from a chrome trace.
+
+    One `bench_kineto` iteration is: L2-flush memset, `spin_kernel` (the ~10 ms
+    sleep), a barrier, then the baseline itself. Rather than blacklisting the
+    harness kernels we anchor on `dispatch_impl`, which only the baseline emits:
+    a segment runs from a `dispatch_impl` up to the next harness kernel. The span
+    (last end - first start) is used instead of a sum so overlapping kernels are
+    not double counted.
+    """
+    import json
+    with open(trace_path) as f:
+        events = json.load(f)['traceEvents']
+    kernels = sorted((e for e in events
+                      if e.get('ph') == 'X' and e.get('cat') in ('kernel', 'gpu_memset')),
+                     key=lambda e: e['ts'])
+
+    def is_harness(name: str) -> bool:
+        low = name.lower()
+        return 'spin_kernel' in low or 'memset' in low or 'barrier' in low
+
+    # Only these belong to the baseline itself. Anything else in the window is
+    # harness noise -- notably `bench_kineto`'s 8 GB L2 flush, which is a
+    # `zero_()` (an elementwise fill kernel, not a memset) and costs ~1 ms.
+    def is_baseline(name: str) -> bool:
+        return 'deep_ep::' in name or 'deep_gemm::' in name or 'swiglu' in name
+
+    spans, cur = [], None
+    for e in kernels:
+        if is_harness(e['name']):
+            if cur:
+                spans.append(cur)
+                cur = None
+            continue
+        if 'dispatch_impl' in e['name']:
+            if cur:
+                spans.append(cur)
+            cur = [e]
+        elif cur is not None and is_baseline(e['name']):
+            cur.append(e)
+    if cur:
+        spans.append(cur)
+
+    spans = [s for s in spans if any('dispatch_impl' in e['name'] for e in s)]
+    if not spans:
+        return 0
+    durs = sorted(max(e['ts'] + e['dur'] for e in s) - min(e['ts'] for e in s) for s in spans)
+    median = durs[len(durs) // 2]
+
+    if rank_idx == 0:
+        # Break the median-length iteration down by kernel, for the write-up.
+        pick = min(spans, key=lambda s: abs((max(e['ts'] + e['dur'] for e in s)
+                                             - min(e['ts'] for e in s)) - median))
+        agg = {}
+        for e in pick:
+            key = e['name'].split('(')[0][:64]
+            agg[key] = agg.get(key, 0) + e['dur']
+        print(f'   baseline breakdown ({len(spans)} iters, median span {median:.1f} us):')
+        for k, v in sorted(agg.items(), key=lambda kv: -kv[1]):
+            print(f'     {v:9.1f} us  {k}')
+        print(f'     {sum(agg.values()):9.1f} us  [sum of kernels]')
+    return median / 1e6
+
+
+# noinspection PyUnusedLocal
 def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     rank_idx, num_ranks, group = init_dist(local_rank, num_local_ranks)
     torch.manual_seed(rank_idx)
@@ -340,9 +405,16 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     barrier_fn = lambda: ep_buffer.barrier(use_comm_stream=False) if ep_buffer else dist.all_reduce(torch.empty(1, device='cuda'))
     trace_path = None if not args.dump_profile_traces else f'{args.dump_profile_traces}/mega_moe_rank{rank_idx}.json'
     t_fused = bench_kineto(run_fused, 'mega_moe', barrier=barrier_fn, trace_path=trace_path)
-    t_baseline = tilelang_bench(
-        run_baseline, _n_warmup=5, _n_repeat=1,
-        backend='cudagraph', return_mode='median') / 1e3 if is_legacy_loaded else 0
+    # NOTES: `do_bench` (either backend) runs the baseline back-to-back with no
+    # cross-rank synchronisation, which lets the 8 ranks drift apart and corrupt
+    # DeepEP's ring buffers (-> cudaErrorLaunchFailure). `bench_kineto` inserts a
+    # sleep + barrier before every iteration, so drive the baseline through it and
+    # recover the per-iteration GPU span from the dumped trace.
+    t_baseline = 0
+    if is_legacy_loaded:
+        bl_trace = f'/tmp/mega_baseline_rank{rank_idx}.json'
+        bench_kineto(run_baseline, 'dispatch_impl', barrier=barrier_fn, trace_path=bl_trace)
+        t_baseline = _baseline_time_from_trace(bl_trace, rank_idx)
 
     # TFLOPS: routed + shared L1/L2, each 2 * M * N * K
     safe_div = lambda a, b: float('nan') if b == 0 else a / b
