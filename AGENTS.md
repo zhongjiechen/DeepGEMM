@@ -326,6 +326,44 @@ per source is ~900 KiB per source — cheap. Start there and tune against measur
 2. Credit flow control, replacing whatever interim synchronisation step 1 uses.
 3. Flip the token payload to a real push and delete the pull.
 
+### Index the landing buffer by source token, not by a packed slot
+
+Scaffolding this out produced a simplification worth writing down before it is rediscovered the
+hard way. Size the landing buffer `[source rank][source token index]` — the same shape as the
+sender's own `input_token_buffer`, replicated per source — rather than packing pushes into
+densely allocated slots. Three subsystems then disappear:
+
+- **No slot allocation.** The index *is* `src_token_idx`, so no atomic counter per destination
+  and no allocation step.
+- **No landing-slot metadata.** The receiver already recovers `src_token_idx` from
+  `src_token_topk_idx`, so it can address the landing slot directly. The `src_token_topk_idx`
+  record does not need widening and its region does not double.
+- **No credit flow control.** Capacity is exactly `num_max_tokens_per_rank` per source, because
+  a sender pushes a given token to a given destination at most once. Within an iteration the
+  landing buffer is write-once / read-once, so there is nothing to recycle and no credits to
+  return. The existing end-of-kernel clean barrier already separates iterations.
+
+The receiver-side change then reduces to swapping one base pointer — from
+`sym_buffer.map(input_token_buffer.get_data_buffer(src_token_idx), src_rank)` (remote) to
+`landing_token_buffer.get_rank_buffer(src_rank).get_data_buffer(src_token_idx)` (local) — and
+gating it on an arrival flag.
+
+Cost is memory: `num_ranks * num_max_tokens_per_rank * token_bytes`, about 58 MB at 8 ranks,
+fp8, hidden 7168. It is sparse — only tokens actually routed to that destination are written.
+
+Two implementation notes that are not obvious:
+
+- **Keep per-token arrival flags; do not gate the payload on a barrier.** Putting all pushes
+  before the pre-pull barrier would turn dispatch into a bulk phase and destroy the
+  compute/comm overlap that is the whole point of the mega-kernel. Sender writes payload,
+  `__threadfence_system()`, then `landing_ready[src][token]`; receiver polls its own flag.
+  Metadata can still ride the existing barrier — it is small.
+- **The sender's de-duplication needs no global atomics and no grid sync.** In `read_topk_idx`
+  a warp owns all `kNumTopk` entries of each of its tokens (lanes are grouped as
+  `token = i + lane_idx / kNumTopk`), so the destination-rank mask can be OR-reduced *within the
+  warp*. `kNumTopk` is not a power of two (6 here), so a butterfly shuffle does not apply — a
+  `kNumTopk`-step `__shfl_sync` from each group member works.
+
 ## Correctness is transport-independent — validate on NVLink first
 
 Every protocol change below (slot barrier, count all-gather, push dispatch) is correct or
@@ -340,9 +378,12 @@ Host-staging and PCIe measurement come *after* the protocol is PCIe-shaped, not 
 |---|---|---|
 | Per-rank slot barrier (replaces remote-atomic barrier) | **validated** | `EP 0/4 \| 2619 TFLOPS \| 363 us` — exact parity with baseline, `torch.equal` checks pass |
 | Count all-gather (drop `expert_recv_count_sum` atomic) | **validated** | `2606 TFLOPS \| 365 us`, −0.5% vs baseline; no remote atomics left in the kernel |
-| Dispatch pull → push | not started | |
-| Landing buffer | not started | |
+| 8-GPU baseline established | **validated** | `EP 0/8 \| 2522 TFLOPS \| 379 us \| NVL 368 GB/s` |
+| Dispatch dedup + landing buffer + push | designed, **not implemented** | see the design section below; scaffolding was reverted rather than left half-written |
+| Combine pre-reduction | designed, not implemented | bigger byte win than dispatch dedup (~12% vs ~6% of total wire traffic) |
+| Split allocation (peer-visible vs local) | not started | |
 | Host-staged transport | not started | |
+| Combine write coalescing, finer chunking | not started | |
 
 The test asserts `torch.equal(fused_y, baseline_y)` and `torch.equal(fused_stats, baseline_stats)`,
 so a passing run is a real correctness check, not just a smoke test.
