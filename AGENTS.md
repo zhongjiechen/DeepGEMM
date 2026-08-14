@@ -26,6 +26,19 @@ Test with **4 GPUs**.
 - Installed: `torch 2.13.0+cu130`. Mega MoE needs torch >= 2.9 for
   `torch.distributed._symmetric_memory`.
 
+**The machine gets rescheduled and comes back with the venv empty, submodules uninitialised and
+no build.** That is expected, not a broken checkout. Full recovery (~6 min, mostly the torch
+download):
+
+```bash
+git submodule update --init --recursive
+~/zj_py/bin/pip install --index-url https://download.pytorch.org/whl/cu130 torch==2.13.0+cu130
+ln -sf $PWD/third-party/cutlass/include/cutlass deep_gemm/include
+ln -sf $PWD/third-party/cutlass/include/cute deep_gemm/include
+CUDA_HOME=/usr/local/cuda-13.1 PATH=/usr/local/cuda-13.1/bin:$PATH ~/zj_py/bin/python setup.py build
+ln -sf ../build/lib.linux-x86_64-cpython-312/deep_gemm/_C.cpython-312-x86_64-linux-gnu.so deep_gemm/
+```
+
 ## Commit cadence
 
 **Commit and push at least every 30 minutes.** The machine can be rescheduled at any time and
@@ -179,6 +192,19 @@ incorrect regardless of which link carries the bytes. So each one is developed a
 against the **NVLink baseline** first, where iteration is fast and the reference numbers exist.
 Host-staging and PCIe measurement come *after* the protocol is PCIe-shaped, not before.
 
+
+## Progress
+
+| step | status | evidence |
+|---|---|---|
+| Per-rank slot barrier (replaces remote-atomic barrier) | **validated** | `EP 0/4 \| 2619 TFLOPS \| 363 us` — exact parity with baseline, `torch.equal` checks pass |
+| Count all-gather (drop `expert_recv_count_sum` atomic) | in progress | |
+| Dispatch pull → push | not started | |
+| Landing buffer | not started | |
+| Host-staged transport | not started | |
+
+The test asserts `torch.equal(fused_y, baseline_y)` and `torch.equal(fused_stats, baseline_stats)`,
+so a passing run is a real correctness check, not just a smoke test.
 
 ## Baseline (NVLink, what we are measured against)
 
