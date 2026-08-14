@@ -69,6 +69,12 @@ struct Workspace {
     // single-counter scheme serialised `num_ranks` of them per barrier.
     static constexpr uint32_t kNumBarrierSlotBytes = 128;
 
+    // Alignment of the workspace end, and so of every data buffer chained after it.
+    static constexpr uint64_t kNumBufferAlignBytes = 256;
+
+    // L1 full, L1 empty, L2 full, L2 empty
+    static constexpr uint32_t kNumRingCountArrays = 4;
+
     Workspace() = default;
 
     CUTLASS_HOST_DEVICE
@@ -95,30 +101,20 @@ struct Workspace {
         return 2 * num_ranks * kNumBarrierSlotBytes;
     }
 
+    // Byte offset from `base` to the first ring counter array.
+    CUTLASS_HOST_DEVICE
+    uint64_t get_ring_counts_begin() const {
+        return kNumBarrierSignalBytes + get_num_barrier_slot_bytes() +
+               num_experts * sizeof(uint64_t) * 2;
+    }
+
     CUTLASS_HOST_DEVICE
     uint64_t get_num_bytes() const {
-        uint64_t num_bytes = 0;
+        // Barrier/schedule counters, cross-rank barrier slots and the expert send/recv counts
+        uint64_t num_bytes = get_ring_counts_begin();
 
-        // Barrier and in-kernel task scheduling counters
-        num_bytes += kNumBarrierSignalBytes;
-
-        // Cross-rank barrier arrival slots
-        num_bytes += get_num_barrier_slot_bytes();
-
-        // Expert send/recv count
-        num_bytes += num_experts * sizeof(uint64_t) * 2;
-
-        // L1 full token count (ring)
-        num_bytes += num_ring_blocks * sizeof(uint32_t);
-
-        // L1 empty block count (ring)
-        num_bytes += num_ring_blocks * sizeof(uint32_t);
-
-        // L2 full block count (ring)
-        num_bytes += num_ring_blocks * sizeof(uint32_t);
-
-        // L2 empty block count (ring)
-        num_bytes += num_ring_blocks * sizeof(uint32_t);
+        // L1 full/empty and L2 full/empty counts
+        num_bytes += kNumRingCountArrays * num_ring_blocks * sizeof(uint32_t);
 
         // Shared L2 full block count
         num_bytes += num_shared_l2_pool_blocks * sizeof(uint32_t);
@@ -129,8 +125,13 @@ struct Workspace {
         // Combine push source indices (full)
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
 
-        // Align to TMA descriptor requirements
-        num_bytes = math::align<uint64_t>(num_bytes, 16);
+        // NOTES: every data buffer is chained off this workspace's end pointer and none of them
+        // re-align, so the workspace's total size sets the alignment of the L1/L2/combine token
+        // buffers -- the ~1400 GB/s TMA traffic. At the previous 16B alignment, adding or
+        // removing a single counter here shifted those buffers and moved end-to-end throughput
+        // by up to 2.3% on the 4-GPU NVLink baseline. Aligning to a full 256B keeps them put:
+        // per-rank buffer sizes are large multiples of 128B, so one aligned start is enough.
+        num_bytes = math::align<uint64_t>(num_bytes, kNumBufferAlignBytes);
         return num_bytes;
     }
 
@@ -208,42 +209,47 @@ struct Workspace {
         return get_expert_send_count_ptr(num_experts) + rank_idx * num_experts_per_rank + expert_idx;
     }
 
+    // Ring counter arrays, packed contiguously after the expert counts
+    // NOTES: `array_idx` is by value so that passing `kNumRingCountArrays` does not ODR-use
+    // the constant, which has no out-of-line definition and so is undefined in device code.
+    CUTLASS_DEVICE
+    uint32_t* get_ring_count_ptr(const uint32_t array_idx, const uint32_t& ring_block_idx) const {
+        return reinterpret_cast<uint32_t*>(
+            static_cast<uint8_t*>(base) + get_ring_counts_begin()) +
+            array_idx * num_ring_blocks + ring_block_idx;
+    }
+
     CUTLASS_DEVICE
     uint32_t* get_l1_full_count_ptr(const uint32_t& ring_block_idx = 0) const {
-        const auto base = get_expert_recv_count_ptr(num_ranks);
-        return reinterpret_cast<uint32_t*>(base) + ring_block_idx;
+        return get_ring_count_ptr(0, ring_block_idx);
     }
 
     CUTLASS_DEVICE
     uint32_t* get_l1_empty_count_ptr(const uint32_t& ring_block_idx = 0) const {
-        const auto base = get_l1_full_count_ptr(num_ring_blocks);
-        return reinterpret_cast<uint32_t*>(base) + ring_block_idx;
+        return get_ring_count_ptr(1, ring_block_idx);
     }
 
     CUTLASS_DEVICE
     uint32_t* get_l2_full_count_ptr(const uint32_t& ring_block_idx = 0) const {
-        const auto base = get_l1_empty_count_ptr(num_ring_blocks);
-        return reinterpret_cast<uint32_t*>(base) + ring_block_idx;
+        return get_ring_count_ptr(2, ring_block_idx);
     }
 
     CUTLASS_DEVICE
     uint32_t* get_l2_empty_count_ptr(const uint32_t& ring_block_idx = 0) const {
-        const auto base = get_l2_full_count_ptr(num_ring_blocks);
-        return reinterpret_cast<uint32_t*>(base) + ring_block_idx;
+        return get_ring_count_ptr(3, ring_block_idx);
     }
 
     CUTLASS_DEVICE
     uint32_t* get_shared_l2_full_count_ptr(const uint32_t& block_idx = 0) const {
-        const auto base = get_l2_empty_count_ptr(num_ring_blocks);
-        return reinterpret_cast<uint32_t*>(base) + block_idx;
+        return get_ring_count_ptr(kNumRingCountArrays, block_idx);
     }
 
     // For dispatch pulling
     CUTLASS_DEVICE
     uint32_t* get_src_token_topk_idx_ptr(
         const uint32_t& expert_idx = 0, const uint32_t& rank_idx = 0, const uint32_t& token_idx = 0) const {
-        const auto base = get_shared_l2_full_count_ptr(num_shared_l2_pool_blocks);
-        return reinterpret_cast<uint32_t*>(base) +
+        const auto base_ptr = get_shared_l2_full_count_ptr(num_shared_l2_pool_blocks);
+        return base_ptr +
             expert_idx * (num_ranks * num_max_recv_tokens_per_expert) +
             rank_idx * num_max_recv_tokens_per_expert + token_idx;
     }

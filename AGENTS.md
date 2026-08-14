@@ -140,14 +140,17 @@ Derived from the numbers above. Violating these is what makes a PCIe port slow.
 
 | site (BF16 / FP8) | region touched | direction |
 |---|---|---|
-| `barrier.cuh:68` | workspace `nvl_barrier_signal` | remote atomic |
+| `barrier.cuh:74` | workspace barrier arrival slot | 4 B store (was a remote atomic) |
 | `:336` / `:376` | workspace `src_token_topk_idx` | 4 B store |
-| `:352` / `:392` | workspace `expert_recv_count` | 8 B store |
-| `:356` / `:396` | workspace `expert_recv_count_sum` | remote atomic |
+| `:352` / `:392` | workspace `expert_recv_count` | 8 B store (was + a remote atomic) |
 | `:494` / `:533` | `input_token_buffer` | **TMA read (the pull)** |
 | — / `:562` | `input_sf_buffer` | read |
 | `:523` / `:581` | `input_topk_weights_buffer` | 4 B read |
 | `:1120` / `:1299` | `combine_token_buffer` | 16 B store |
+
+**No remote atomics remain** — `ptx::atomic_add_sys` and `ptx::red_add_rel_sys` are still
+defined but have no call sites. Design rule 2 is satisfied. What is left is rule 1: the
+dispatch pull, which is the next and by far the largest piece of work.
 
 Everything else is local-only and must stay in HBM: `l1_*`, `l2_*`, `shared_*`,
 `input_topk_idx_buffer`, `expert_send_count`, grid-sync and task counters, the L1/L2 ring
@@ -198,13 +201,53 @@ Host-staging and PCIe measurement come *after* the protocol is PCIe-shaped, not 
 | step | status | evidence |
 |---|---|---|
 | Per-rank slot barrier (replaces remote-atomic barrier) | **validated** | `EP 0/4 \| 2619 TFLOPS \| 363 us` — exact parity with baseline, `torch.equal` checks pass |
-| Count all-gather (drop `expert_recv_count_sum` atomic) | in progress | |
+| Count all-gather (drop `expert_recv_count_sum` atomic) | **validated** | `2606 TFLOPS \| 365 us`, −0.5% vs baseline; no remote atomics left in the kernel |
 | Dispatch pull → push | not started | |
 | Landing buffer | not started | |
 | Host-staged transport | not started | |
 
 The test asserts `torch.equal(fused_y, baseline_y)` and `torch.equal(fused_stats, baseline_stats)`,
 so a passing run is a real correctness check, not just a smoke test.
+
+**`--mma-type` defaults to `fp8xfp4`, so a default run does not touch
+`sm100_bf16_mega_moe.cuh` at all.** Both impls carry the same protocol code, so every change
+must be run twice:
+
+```bash
+... tests/test_mega_moe.py --num-processes 4 --num-experts 32 --num-max-tokens-per-rank 1024
+... tests/test_mega_moe.py --num-processes 4 --num-experts 32 --num-max-tokens-per-rank 1024 --mma-type bf16xbf16
+```
+
+bf16xbf16 reference: `EP 0/4 | 1171 TFLOPS | 812 us`.
+
+## Workspace size silently sets activation-buffer alignment
+
+Every data buffer is chained off the previous one's `get_end_ptr()` and **no `Buffer` re-aligns
+its own base**, so the first one starts wherever `Workspace::get_num_bytes()` ends. That end was
+only 16 B-aligned, which means *adding or removing a single counter in the workspace shifts the
+L1/L2/combine token buffers* — the ~1400 GB/s TMA traffic.
+
+This is not theoretical. Removing the 64 B `expert_recv_count_sum` region cost 2.3% end-to-end
+with no protocol change involved, and it took four measured variants to find that the layout,
+not the protocol, was responsible:
+
+| variant | EP 0/4 TFLOPS |
+|---|---|
+| baseline (before any change) | 2620, 2619 |
+| count all-gather + 256 B workspace end alignment | **2606, 2606** |
+| count all-gather + 64 B pad restoring the old offsets | 2610, 2602, 2600 |
+| count all-gather + each ring counter array on its own 128 B line | 2583, 2581 |
+| count all-gather, 16 B end alignment (naive) | 2557, 2560, 2565 |
+
+Note the third row: per-array line padding, the "obvious" false-sharing fix, made things *worse*.
+The ring counters were never the problem.
+
+`get_num_bytes()` now aligns to 256 B (`kNumBufferAlignBytes`). Per-rank buffer sizes are large
+multiples of 128 B, so one aligned start keeps everything downstream aligned. Two runs produced
+byte-identical throughput, where the unaligned variants jittered.
+
+**Rule: when you change the workspace layout, re-measure.** If throughput moves by ~1-2% and the
+protocol change does not explain it, suspect this before anything else.
 
 ## Baseline (NVLink, what we are measured against)
 
