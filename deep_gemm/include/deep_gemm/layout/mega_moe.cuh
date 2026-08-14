@@ -108,9 +108,6 @@ struct Workspace {
         // Expert send/recv count
         num_bytes += num_experts * sizeof(uint64_t) * 2;
 
-        // Expert recv count sum
-        num_bytes += num_experts_per_rank * sizeof(uint64_t);
-
         // L1 full token count (ring)
         num_bytes += num_ring_blocks * sizeof(uint32_t);
 
@@ -201,6 +198,10 @@ struct Workspace {
             base, kNumBarrierSignalBytes + get_num_barrier_slot_bytes()) + expert_idx;
     }
 
+    // Per-source-rank token counts, written by the sending rank and read only locally.
+    // NOTES: the stored value is the count biased by 1, so that 0 means "has not arrived
+    // yet". The count is therefore its own arrival flag and an expert that legitimately
+    // receives nothing is still distinguishable from one whose count is still in flight.
     CUTLASS_DEVICE
     uint64_t* get_expert_recv_count_ptr(
         const uint32_t& rank_idx = 0, const uint32_t& expert_idx = 0) const {
@@ -208,13 +209,8 @@ struct Workspace {
     }
 
     CUTLASS_DEVICE
-    uint64_t* get_expert_recv_count_sum_ptr(const uint32_t& expert_idx = 0) const {
-        return get_expert_send_count_ptr(num_experts * 2) + expert_idx;
-    }
-
-    CUTLASS_DEVICE
     uint32_t* get_l1_full_count_ptr(const uint32_t& ring_block_idx = 0) const {
-        const auto base = get_expert_recv_count_sum_ptr(num_experts_per_rank);
+        const auto base = get_expert_recv_count_ptr(num_ranks);
         return reinterpret_cast<uint32_t*>(base) + ring_block_idx;
     }
 

@@ -251,13 +251,24 @@ struct MegaMoEScheduler {
         #pragma unroll
         for (uint32_t i = 0; i < kNumExpertsPerLane; ++ i) {
             const auto expert_idx = i * 32 + ptx::get_lane_idx();
-            uint64_t value = 0;
+            uint32_t num_tokens = 0;
             if (expert_idx < kNumExpertsPerRank) {
-                do {
-                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
-                } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
+                // Sum this expert's per-rank counts. Every load is local: senders push their
+                // count into our slot, so there is no remote atomic and no remote read here.
+                // A slot reads 0 until its rank's count lands, and counts are biased by 1, so
+                // a rank that routed nothing to this expert still publishes 1 and the wait
+                // terminates.
+                #pragma unroll
+                for (uint32_t j = 0; j < kNumRanks; ++ j) {
+                    const auto ptr = workspace.get_expert_recv_count_ptr(j, expert_idx);
+                    uint64_t value;
+                    do {
+                        value = ptx::ld_volatile(ptr);
+                    } while (value == 0);
+                    num_tokens += static_cast<uint32_t>(value) - 1;
+                }
             }
-            stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);
+            stored_num_tokens_per_expert[i] = num_tokens;
         }
         __syncwarp();
 

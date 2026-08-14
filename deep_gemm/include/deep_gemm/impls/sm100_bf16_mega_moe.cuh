@@ -343,18 +343,21 @@ sm100_bf16_mega_moe_impl(void* y,
         );
 
         // Write expert count
+        // NOTES: the count is biased by 1 so that a zero slot means "not arrived yet". The
+        // count is then its own arrival flag, which removes the remote atomic that used to
+        // accumulate `expert_recv_count_sum` on the destination rank -- receivers now sum
+        // their own slots locally. On PCIe that atomic was a ~0.96us round trip per expert.
         if (sm_idx == 0) {
             #pragma unroll
             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
                 const auto dst_rank_idx = i / kNumExpertsPerRank;
                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
                 const auto expert_status = *workspace.get_expert_send_count_ptr(i);
-                *sym_buffer.map(
-                    workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
-                    dst_rank_idx) = expert_status & 0xffffffff;
-                ptx::atomic_add_sys(
-                    sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
-                    expert_status);
+                ptx::st_rel_sys(
+                    sym_buffer.map(
+                        workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
+                        dst_rank_idx),
+                    (expert_status & 0xffffffff) + 1);
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
@@ -413,8 +416,9 @@ sm100_bf16_mega_moe_impl(void* y,
                 for (uint32_t i = 0; i < kNumRanksPerLane; ++ i) {
                     const uint32_t j = i * 32 + lane_idx;
                     // TODO: this is not coalesced
+                    // NOTES: counts are stored biased by 1 (see `get_expert_recv_count_ptr`)
                     stored_rank_count[i] = j < kNumRanks ?
-                        static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, current_expert_idx)) : 0;
+                        static_cast<uint32_t>(*workspace.get_expert_recv_count_ptr(j, current_expert_idx)) - 1 : 0;
                 }
             }
 
@@ -563,9 +567,8 @@ sm100_bf16_mega_moe_impl(void* y,
         } else {
             // Other SMs: clean blocks
             for (uint32_t i = sm_idx - 1; i < kNumExpertsPerRank; i += kNumSMs - 1) {
-                // Read expert token count before clearing
-                const auto num_recv_tokens = static_cast<uint32_t>(
-                    *workspace.get_expert_recv_count_sum_ptr(i));
+                // Expert token count, already summed locally by the scheduler
+                const auto num_recv_tokens = scheduler.get_num_tokens(i);
                 const auto num_recv_m_blocks = math::ceil_div(num_recv_tokens, BLOCK_M);
 
                 // Compute expert pool block offset
@@ -574,17 +577,16 @@ sm100_bf16_mega_moe_impl(void* y,
                 // Wait read count ready
                 ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
-                // Clean expert token count, and add cumulative results
+                // Add cumulative results
                 DG_STATIC_ASSERT(kNumDispatchWarps >= 2, "Not enough dispatch warps");
-                if (warp_idx == 0) {
-                    *workspace.get_expert_recv_count_sum_ptr(i) = 0;
-                } else if (warp_idx == 1) {
+                if (warp_idx == 1) {
                     if (cute::elect_one_sync() and cumulative_local_expert_recv_stats != nullptr)
                         ptx::red_add(cumulative_local_expert_recv_stats + i, static_cast<int>(num_recv_tokens));
                     __syncwarp();
                 }
 
-                // Clean per-rank token count
+                // Clean per-rank token count, so that the next dispatch can use zero to mean
+                // "not arrived yet" again. The clean is published by the barrier at the end.
                 for (uint32_t j = thread_idx; j < kNumRanks; j += kNumDispatchThreads)
                     *workspace.get_expert_recv_count_ptr(j, i) = 0;
                 __syncwarp();
