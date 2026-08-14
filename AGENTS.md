@@ -144,6 +144,42 @@ This split matters because the host-staged test transport would otherwise put th
 activation ring buffers in host DRAM, which would both destroy performance and misrepresent
 what PCIe costs. Only the 8 regions above belong in the peer-visible allocation.
 
+## Why host-staging cannot measure performance on its own
+
+A receive buffer is *both* written remotely and read locally by the GEMM. Host-staging forces
+one location for both, so the local read gets charged PCIe latency it would never pay on a real
+PCIe machine (where the receive buffer sits in the receiver's own HBM and only the sender's
+write crosses the link).
+
+Concretely: `input_token_buffer` is remotely read by the dispatch pull *and* TMA-read locally by
+the shared-expert L1 GEMM. After the pull→push conversion the problem simply moves — the
+receiver's `l1_token_buffer` becomes the remotely-written region while still being the GEMM's
+main TMA input at ~1400 GB/s. Putting that in host DRAM at 51 GB/s would dominate the whole
+kernel and tell us nothing about PCIe.
+
+**Consequence:** host-staging is a *correctness* vehicle, not a performance vehicle, unless the
+design gives remote traffic its own landing buffer.
+
+### The landing-buffer design (which we want anyway)
+
+Senders push into a small contiguous **landing buffer**, and the receiver locally copies and
+reformats from the landing buffer into its HBM ring. This is the right shape for PCIe
+regardless of emulation: it turns scattered small remote writes into coalesced large ones
+(rule 3), and it decouples wire format from GEMM layout.
+
+It also makes host-staging measurable: only the landing buffer and the small control regions go
+in host memory. The emulated number is then **pessimistic by exactly one PCIe hop on the
+receive side** (landing buffer read), because a real P2P machine would land in HBM. That is a
+bounded, explainable error we can subtract, unlike the unbounded error above.
+
+## Correctness is transport-independent — validate on NVLink first
+
+Every protocol change below (slot barrier, count all-gather, push dispatch) is correct or
+incorrect regardless of which link carries the bytes. So each one is developed and verified
+against the **NVLink baseline** first, where iteration is fast and the reference numbers exist.
+Host-staging and PCIe measurement come *after* the protocol is PCIe-shaped, not before.
+
+
 ## Baseline (NVLink, what we are measured against)
 
 4 GPUs (0-3), `--num-experts 32 --num-max-tokens-per-rank 1024`, `mma_type=fp8xfp4`:

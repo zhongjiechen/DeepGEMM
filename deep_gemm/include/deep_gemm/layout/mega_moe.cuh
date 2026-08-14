@@ -62,6 +62,13 @@ struct Workspace {
     // NVIDIA L2 cache lines are 128B, and these counters are hot atomics.
     static constexpr uint64_t kNumBarrierSignalBytes = 128;
 
+    // Cross-rank barrier arrival slots: one per (phase, source rank), each on its own
+    // 128B line. Giving every source its own slot is what lets a rank announce arrival
+    // with a plain store instead of a remote atomic -- there is exactly one writer per
+    // slot. On PCIe a remote atomic costs ~0.96us versus a posted write, and the old
+    // single-counter scheme serialised `num_ranks` of them per barrier.
+    static constexpr uint32_t kNumBarrierSlotBytes = 128;
+
     Workspace() = default;
 
     CUTLASS_HOST_DEVICE
@@ -83,11 +90,20 @@ struct Workspace {
     }
 
     CUTLASS_HOST_DEVICE
+    uint32_t get_num_barrier_slot_bytes() const {
+        // Two phases so a rank can be at most one barrier ahead of its peers.
+        return 2 * num_ranks * kNumBarrierSlotBytes;
+    }
+
+    CUTLASS_HOST_DEVICE
     uint64_t get_num_bytes() const {
         uint64_t num_bytes = 0;
 
         // Barrier and in-kernel task scheduling counters
         num_bytes += kNumBarrierSignalBytes;
+
+        // Cross-rank barrier arrival slots
+        num_bytes += get_num_barrier_slot_bytes();
 
         // Expert send/recv count
         num_bytes += num_experts * sizeof(uint64_t) * 2;
@@ -128,8 +144,8 @@ struct Workspace {
 
     // Grid sync counters: `kNumBarrierSignalBytes` layout
     // [ 0..15]: 4 x `uint32_t` grid sync counters
-    // [16..20]: `uint32_t` NVLink barrier counter
-    // [20..27]: 2 x `int` NVLink barrier signals (phase 0 and 1)
+    // [16..20]: `uint32_t` cross-rank barrier counter (local only)
+    // [20..27]: unused (the barrier signals now live in their own padded slot array)
     // [28..31]: `uint32_t` L1 schedule task counter
     // [32..35]: `uint32_t` L2 schedule task counter
     // [36..39]: `uint32_t` shared L1 schedule task counter
@@ -149,11 +165,15 @@ struct Workspace {
         return static_cast<uint32_t*>(base) + kNumMaxGridSyncCounters;
     }
 
+    // Arrival slot that `src_rank_idx` writes into, for the given phase.
+    // NOTES: the value is signed, as the target alternates between 1 and 0
     CUTLASS_DEVICE
-    int* get_nvl_barrier_signal_ptr(const uint32_t& phase) const {
-        // NOTES: the signal is signed, as we may minus
-        return math::advance_ptr<int>(base, (kNumMaxGridSyncCounters + 1) * sizeof(uint32_t) + phase * sizeof(int));
+    int* get_nvl_barrier_signal_ptr(const uint32_t& phase, const uint32_t& src_rank_idx = 0) const {
+        return reinterpret_cast<int*>(
+            static_cast<uint8_t*>(base) + kNumBarrierSignalBytes +
+            (phase * num_ranks + src_rank_idx) * static_cast<uint64_t>(kNumBarrierSlotBytes));
     }
+
 
     CUTLASS_DEVICE
     uint32_t* get_l1_task_count_ptr() const {
@@ -177,7 +197,8 @@ struct Workspace {
 
     CUTLASS_DEVICE
     uint64_t* get_expert_send_count_ptr(const uint32_t& expert_idx = 0) const {
-        return math::advance_ptr<uint64_t>(base, kNumBarrierSignalBytes) + expert_idx;
+        return math::advance_ptr<uint64_t>(
+            base, kNumBarrierSignalBytes + get_num_barrier_slot_bytes()) + expert_idx;
     }
 
     CUTLASS_DEVICE

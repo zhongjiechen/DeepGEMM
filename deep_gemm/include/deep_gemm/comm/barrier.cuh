@@ -51,39 +51,63 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
                                    const bool& sync_prologue = true,
                                    const bool& sync_epilogue = true) {
     DG_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
+    DG_STATIC_ASSERT(kNumThreads >= 32, "Need at least one warp to poll arrivals");
 
-    // Grid sync before NVLink signaling
+    // Grid sync before cross-rank signaling
     if (sync_prologue)
         grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
 
-    // NVLink cross-rank barrier, only SM 0 participates
+    // Cross-rank barrier, only SM 0 participates
     if (sm_idx == 0) {
         auto* counter_ptr = workspace.get_nvl_barrier_counter_ptr();
         const auto status = (*counter_ptr) & 3;
         const auto signal_phase = status & 1, signal_sign = status >> 1;
-        auto* signal_ptr = workspace.get_nvl_barrier_signal_ptr(signal_phase);
 
-        // Send signals to remote ranks
-        if (thread_idx < kNumRanks)
-            ptx::red_add_rel_sys(sym_buffer.map(signal_ptr, thread_idx), signal_sign ? -1 : 1);
+        // The target alternates between 1 and 0 on successive uses of the same phase, so a
+        // stale value from two barriers ago can never be mistaken for an arrival.
+        const int target = signal_sign ? 0 : 1;
+
+        // Announce arrival in every peer's slot for *our* rank. Each (peer, source) slot has
+        // exactly one writer, so a plain release store replaces the remote atomic the previous
+        // implementation needed when all ranks shared one counter.
+        if (thread_idx < kNumRanks) {
+            ptx::st_rel_sys(
+                sym_buffer.map(workspace.get_nvl_barrier_signal_ptr(signal_phase, sym_buffer.rank_idx),
+                               thread_idx),
+                target);
+        }
         sync_scope();
 
-        // Update status and wait arrival
-        if (thread_idx == 0) {
+        // Advance the (rank-local) phase counter
+        if (thread_idx == 0)
             ptx::red_add(counter_ptr, 1);
-            const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);
+
+        // Wait for arrivals. Every load here is *local* -- we only ever read our own slot
+        // array -- which is what keeps this off the PCIe critical path.
+        if (thread_idx < 32) {
+            const auto lane_idx = thread_idx;
             const auto start_clock = clock64();
-            while (ptx::ld_acq_sys(signal_ptr) != target) {
+            while (true) {
+                bool arrived = true;
+                #pragma unroll
+                for (uint32_t base = 0; base < kNumRanks; base += 32) {
+                    const uint32_t src_rank_idx = base + lane_idx;
+                    if (src_rank_idx < kNumRanks)
+                        arrived &= ptx::ld_acq_sys(
+                            workspace.get_nvl_barrier_signal_ptr(signal_phase, src_rank_idx)) == target;
+                }
+                if (__all_sync(0xffffffff, arrived))
+                    break;
                 if (clock64() - start_clock >= kNumTimeoutCycles) {
-                    printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
-                           sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
-                    DG_DEVICE_ASSERT(false and "NVLink barrier timeout");
+                    printf("DeepGEMM cross-rank barrier timeout: rank=%d, lane=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
+                           sym_buffer.rank_idx, lane_idx, target, signal_phase, signal_sign, kTag);
+                    DG_DEVICE_ASSERT(false and "Cross-rank barrier timeout");
                 }
             }
         }
     }
 
-    // Grid sync after NVLink completion
+    // Grid sync after cross-rank completion
     if (sync_epilogue)
         grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
 }
