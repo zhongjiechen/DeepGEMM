@@ -25,3 +25,11 @@ deep_gemm/*.so
 # Coredumps
 core
 core.*
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+deep_gemm/include/cutlass
+deep_gemm/include/cute
+deep_gemm/*.so

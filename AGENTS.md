@@ -120,6 +120,60 @@ Derived from the numbers above. Violating these is what makes a PCIe port slow.
 - `deep_gemm/mega/__init__.py` — `SymmBuffer`, allocation and rendezvous.
 - `csrc/apis/mega.hpp` — host-side entry points.
 
+## The complete remote-access surface
+
+`grep -n sym_buffer.map` over the impls and `barrier.cuh` is the authoritative list — it is the
+*only* way the kernel reaches another rank. 7 sites in BF16, 8 in FP8/FP4:
+
+| site (BF16 / FP8) | region touched | direction |
+|---|---|---|
+| `barrier.cuh:68` | workspace `nvl_barrier_signal` | remote atomic |
+| `:336` / `:376` | workspace `src_token_topk_idx` | 4 B store |
+| `:352` / `:392` | workspace `expert_recv_count` | 8 B store |
+| `:356` / `:396` | workspace `expert_recv_count_sum` | remote atomic |
+| `:494` / `:533` | `input_token_buffer` | **TMA read (the pull)** |
+| — / `:562` | `input_sf_buffer` | read |
+| `:523` / `:581` | `input_topk_weights_buffer` | 4 B read |
+| `:1120` / `:1299` | `combine_token_buffer` | 16 B store |
+
+Everything else is local-only and must stay in HBM: `l1_*`, `l2_*`, `shared_*`,
+`input_topk_idx_buffer`, `expert_send_count`, grid-sync and task counters, the L1/L2 ring
+full/empty counts, and `token_src_metadata`.
+
+This split matters because the host-staged test transport would otherwise put the GEMM
+activation ring buffers in host DRAM, which would both destroy performance and misrepresent
+what PCIe costs. Only the 8 regions above belong in the peer-visible allocation.
+
+## Baseline (NVLink, what we are measured against)
+
+4 GPUs (0-3), `--num-experts 32 --num-max-tokens-per-rank 1024`, `mma_type=fp8xfp4`:
+
+```
+EP 0/4 | 2619 TFLOPS | overlap: 2739 TFLOPS, HBM 1430 GB/s, NVL 382 GB/s | 363 us, reduction 15.8 us
+```
+
+Reproduce with:
+
+```bash
+PYTHONPATH=/home/zhongjiechen/DeepGEMM CUDA_HOME=/usr/local/cuda-13.1 \
+  PATH=/usr/local/cuda-13.1/bin:$PATH CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  ~/zj_py/bin/python tests/test_mega_moe.py --num-processes 4 \
+  --num-experts 32 --num-max-tokens-per-rank 1024
+```
+
+Note the kernel sustains 382 GB/s of NVLink traffic. PCIe tops out at ~51 GB/s, so comm time
+alone rises by roughly 7.5x and stops hiding under compute.
+
+## Build
+
+```bash
+git submodule update --init --recursive
+ln -sf $PWD/third-party/cutlass/include/cutlass deep_gemm/include
+ln -sf $PWD/third-party/cutlass/include/cute deep_gemm/include
+CUDA_HOME=/usr/local/cuda-13.1 PATH=/usr/local/cuda-13.1/bin:$PATH ~/zj_py/bin/python setup.py build
+ln -sf ../build/lib.linux-x86_64-cpython-312/deep_gemm/_C.cpython-312-x86_64-linux-gnu.so deep_gemm/
+```
+
 ## Testing
 
 ```bash
