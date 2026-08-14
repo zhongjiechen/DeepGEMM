@@ -190,14 +190,15 @@ bounded, explainable error we can subtract, unlike the unbounded error above.
 
 ## Next step: converting the dispatch pull to a push
 
-This is the largest remaining piece. Two things make it more than a mechanical inversion.
+This is the largest remaining piece. The choice that drives everything else is **who assigns the
+destination pool slot**, and it is not obvious in the direction it first appears.
 
-### 1. The sender must invert the receiver's slot assignment
+### The slot assignment, and why it should stay on the receiver
 
-Today the receiver decides where each token goes: for local expert `e` with per-rank counts
-`c[0..R-1]`, it walks pool slot `s` through a round-robin min-peel (`sm100_bf16_mega_moe.cuh`
-~line 421) to recover `(src_rank, token_idx_in_rank)`. A sender must compute the *inverse* —
-given "I am rank `m`, this is my `k`-th token for expert `e`", produce `s`:
+Today the receiver decides: for local expert `e` with per-rank counts `c[0..R-1]`, it walks pool
+slot `s` through a round-robin min-peel (`sm100_bf16_mega_moe.cuh` ~line 421) to recover
+`(src_rank, token_idx_in_rank)`. A push needs the *inverse* — given "rank `m`'s `k`-th token for
+expert `e`", produce `s`:
 
 ```
 remaining = c; offset = 0; s_base = 0
@@ -213,46 +214,58 @@ loop:
 ```
 
 Substituting back into the forward peel recovers `token_idx_in_rank == k`, so the two agree.
-`pool_token_idx = pool_block_offset(e) * BLOCK_M + s`, where `pool_block_offset` sums
-`ceil_div(total, BLOCK_M)` over the destination's *earlier* local experts.
+`pool_token_idx = pool_block_offset(e) * BLOCK_M + s`.
 
-**Consequence: the count exchange must become a full all-gather.** A sender needs `c[*]` for
-every expert it sends to, i.e. the whole `num_ranks x num_experts` matrix, not just the row it
-currently pushes to the owner. That matrix is 1 KiB at 4 ranks / 32 experts, and each rank
-writes its own row as *one 256 B coalesced store per peer* — strictly better on PCIe than
-today's 8 scattered 8 B stores. Do this as part of the push change, not before: the extra
-columns are dead (and therefore unvalidatable) until the push consumes them.
+The trap is assuming the *sender* must run this. It only must if the sender writes the ring
+directly, and that costs two things:
 
-### 2. Ring flow control cannot survive a naive push
+- **A count all-gather.** `s` depends on `c[*]`, all ranks' counts for that expert, so every
+  sender needs the whole `num_ranks x num_experts` matrix rather than the single row it pushes
+  today.
+- **An extra cross-rank barrier.** `c[*]` is not known until every rank has finished counting,
+  so slot assignment cannot start until a barrier completes. Today slot allocation
+  (`atomicAdd_block`, ~line 331) runs *before* the count exchange precisely because it does not
+  need global counts. A direct push serialises count -> barrier -> assign -> send.
+
+**A landing buffer removes both.** If senders push into `landing[src_rank]` in whatever order
+they like and the receiver places tokens into ring slots, then the inverse mapping runs on the
+receiver — which already has `c[*]` locally and already waits for it in
+`fetch_expert_recv_count()`. No all-gather, no extra barrier, and the sender never needs to know
+anything about the destination's layout.
+
+### Ring flow control cannot survive a naive push either
 
 The receiver's ring slot is only reusable once its L1 GEMM consumer has drained it, which the
-puller checks today via a **local** read of `l1_empty_count`. If the sender writes the ring
-directly it has to check that counter on the *receiver* — a remote read, which is exactly what
-rule 1 forbids, and a non-posted PCIe round trip on the critical path.
+puller checks today via a **local** read of `l1_empty_count`. A sender writing the ring directly
+would have to check that counter on the *receiver* — a remote read, which rule 1 forbids and
+which is a non-posted PCIe round trip on the critical path.
 
-This is the real argument for the landing buffer, independent of host-staging:
+The landing buffer answers this too:
 
 - Sender pushes into `landing[src_rank]` on the receiver, a region it owns exclusively, so no
   cross-rank arbitration and no remote read.
-- Receiver copies `landing -> ring` locally, honouring its own `l1_empty_count` as it does now.
+- Receiver copies `landing -> ring` locally, honouring its own `l1_empty_count` as it does now,
+  and applying the inverse mapping above.
 - Receiver pushes a **credit** (a monotonic count of tokens drained) into the sender's local
   `credit[dst_rank]` slot. The sender polls only its own array.
 
 Both sides then read only local memory, and both directions are posted writes.
 
+**The cost is one extra local copy.** The pull does remote -> smem -> ring; landing does
+remote -> landing, then landing -> smem -> ring, so each token pays an extra HBM write and read.
+At ~51 GB/s on the wire against ~1400 GB/s of HBM that is not the binding constraint, but it is
+the reason to keep direct-to-ring in mind as a later optimisation if profiling says otherwise.
+
 Sizing: at ~51 GB/s a 14 KiB token occupies the wire for ~274 ns, so covering a credit round
 trip of a few µs needs on the order of tens of tokens in flight per (src, dst) pair. 64 tokens
 per source is ~900 KiB per source — cheap. Start there and tune against measurement.
 
-The extra local `landing -> ring` copy costs HBM bandwidth that the pull does not pay, but at
-51 GB/s on the wire versus ~1400 GB/s HBM it is not the binding constraint.
-
 **Suggested staging** — each step validated on NVLink before the next:
 
-1. Count all-gather + sender-side inverse mapping, still pulling (assert the sender's computed
-   `s` matches the slot the receiver picks; a mismatch is a silent corruption otherwise).
-2. Landing buffer + credit flow control, receiver still driving the copy.
-3. Flip dispatch to a real push and delete the pull.
+1. Landing buffer + receiver-side placement, sender still writing metadata as it does now.
+   Correctness of the inverse mapping is checked by the existing `torch.equal` assertions.
+2. Credit flow control, replacing whatever interim synchronisation step 1 uses.
+3. Flip the token payload to a real push and delete the pull.
 
 ## Correctness is transport-independent — validate on NVLink first
 
