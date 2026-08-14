@@ -188,6 +188,72 @@ in host memory. The emulated number is then **pessimistic by exactly one PCIe ho
 receive side** (landing buffer read), because a real P2P machine would land in HBM. That is a
 bounded, explainable error we can subtract, unlike the unbounded error above.
 
+## Next step: converting the dispatch pull to a push
+
+This is the largest remaining piece. Two things make it more than a mechanical inversion.
+
+### 1. The sender must invert the receiver's slot assignment
+
+Today the receiver decides where each token goes: for local expert `e` with per-rank counts
+`c[0..R-1]`, it walks pool slot `s` through a round-robin min-peel (`sm100_bf16_mega_moe.cuh`
+~line 421) to recover `(src_rank, token_idx_in_rank)`. A sender must compute the *inverse* —
+given "I am rank `m`, this is my `k`-th token for expert `e`", produce `s`:
+
+```
+remaining = c; offset = 0; s_base = 0
+loop:
+    A = #{r : remaining[r] > 0}                  // active ranks
+    L = min{remaining[r] : remaining[r] > 0}     // this round's depth
+    if k < offset + L:                           // my token lands in this round
+        a = rank m's 0-based position among the active ranks
+        s = s_base + (k - offset) * A + a
+        break
+    s_base += L * A; offset += L
+    for r: remaining[r] -= min(remaining[r], L)
+```
+
+Substituting back into the forward peel recovers `token_idx_in_rank == k`, so the two agree.
+`pool_token_idx = pool_block_offset(e) * BLOCK_M + s`, where `pool_block_offset` sums
+`ceil_div(total, BLOCK_M)` over the destination's *earlier* local experts.
+
+**Consequence: the count exchange must become a full all-gather.** A sender needs `c[*]` for
+every expert it sends to, i.e. the whole `num_ranks x num_experts` matrix, not just the row it
+currently pushes to the owner. That matrix is 1 KiB at 4 ranks / 32 experts, and each rank
+writes its own row as *one 256 B coalesced store per peer* — strictly better on PCIe than
+today's 8 scattered 8 B stores. Do this as part of the push change, not before: the extra
+columns are dead (and therefore unvalidatable) until the push consumes them.
+
+### 2. Ring flow control cannot survive a naive push
+
+The receiver's ring slot is only reusable once its L1 GEMM consumer has drained it, which the
+puller checks today via a **local** read of `l1_empty_count`. If the sender writes the ring
+directly it has to check that counter on the *receiver* — a remote read, which is exactly what
+rule 1 forbids, and a non-posted PCIe round trip on the critical path.
+
+This is the real argument for the landing buffer, independent of host-staging:
+
+- Sender pushes into `landing[src_rank]` on the receiver, a region it owns exclusively, so no
+  cross-rank arbitration and no remote read.
+- Receiver copies `landing -> ring` locally, honouring its own `l1_empty_count` as it does now.
+- Receiver pushes a **credit** (a monotonic count of tokens drained) into the sender's local
+  `credit[dst_rank]` slot. The sender polls only its own array.
+
+Both sides then read only local memory, and both directions are posted writes.
+
+Sizing: at ~51 GB/s a 14 KiB token occupies the wire for ~274 ns, so covering a credit round
+trip of a few µs needs on the order of tens of tokens in flight per (src, dst) pair. 64 tokens
+per source is ~900 KiB per source — cheap. Start there and tune against measurement.
+
+The extra local `landing -> ring` copy costs HBM bandwidth that the pull does not pay, but at
+51 GB/s on the wire versus ~1400 GB/s HBM it is not the binding constraint.
+
+**Suggested staging** — each step validated on NVLink before the next:
+
+1. Count all-gather + sender-side inverse mapping, still pulling (assert the sender's computed
+   `s` matches the slot the receiver picks; a mismatch is a silent corruption otherwise).
+2. Landing buffer + credit flow control, receiver still driving the copy.
+3. Flip dispatch to a real push and delete the pull.
+
 ## Correctness is transport-independent — validate on NVLink first
 
 Every protocol change below (slot barrier, count all-gather, push dispatch) is correct or
