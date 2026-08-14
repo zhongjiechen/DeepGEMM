@@ -376,6 +376,105 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
         });
 
+        // Push token payloads into peers' landing buffers.
+        // NOTES: a warp owns all `kNumTopk` entries of each of its tokens, so the destination
+        // rank set is reduced inside the warp -- no global atomics and no grid sync needed. A
+        // token selected by several experts on one destination is pushed exactly once, which is
+        // where the dispatch de-duplication comes from. The payload is published with a
+        // per-token flag rather than the barrier below, so receivers can start consuming tokens
+        // while the rest are still in flight.
+        {
+            constexpr uint32_t kNumPushSFUint32 = kHidden / 128;
+
+            #pragma unroll 1
+            for (uint32_t i = (sm_idx * kNumDispatchWarps + warp_idx) * kNumTokensPerWarp;
+                 i < num_tokens;
+                 i += kNumSMs * kNumDispatchWarps * kNumTokensPerWarp) {
+                // This lane's destination-rank bit
+                uint32_t lane_mask = 0;
+                if (i + (lane_idx / kNumTopk) < num_tokens and lane_idx < kNumActivateLanes) {
+                    const auto expert_idx = static_cast<int>(
+                        __ldg(buffer.input_topk_idx_buffer.get_base_ptr<int64_t>() + i * kNumTopk + lane_idx));
+                    if (expert_idx >= 0)
+                        lane_mask = 1u << (expert_idx / kNumExpertsPerRank);
+                }
+
+                // OR-reduce over each token's `kNumTopk` lanes.
+                // NOTES: `kNumTopk` need not be a power of two, so a butterfly shuffle does not
+                // apply -- gather from every member of the group instead.
+                uint32_t token_mask = 0;
+                const auto group_base = (lane_idx / kNumTopk) * kNumTopk;
+                #pragma unroll
+                for (uint32_t t = 0; t < kNumTopk; ++ t)
+                    token_mask |= __shfl_sync(0xffffffff, lane_mask, group_base + t);
+
+                #pragma unroll 1
+                for (uint32_t t = 0; t < kNumTokensPerWarp; ++ t) {
+                    const uint32_t token_idx = i + t;
+                    if (token_idx >= num_tokens)
+                        break;
+                    const uint32_t dst_mask = __shfl_sync(0xffffffff, token_mask, t * kNumTopk);
+
+                    const auto src_base_ptr = buffer.input_token_buffer.get_data_buffer(token_idx).get_base_ptr();
+                    const auto src_sf_ptr = buffer.input_sf_buffer.get_data_buffer(token_idx).template get_base_ptr<uint32_t>();
+                    const auto src_weight_ptr = buffer.input_topk_weights_buffer.template get_base_ptr<float>() + token_idx * kNumTopk;
+
+                    #pragma unroll 1
+                    for (uint32_t r = 0; r < kNumRanks; ++ r) {
+                        if (((dst_mask >> r) & 1) == 0)
+                            continue;
+
+                        // Token payload: local HBM -> peer landing slot.
+                        // NOTES: a plain vectorised copy, not TMA. Consecutive lanes carry
+                        // consecutive 16B chunks so the warp emits 512B of contiguous remote
+                        // writes per step, which is what rule 3 asks for. It also keeps the
+                        // dispatch m-barriers untouched, so the pull below still starts from a
+                        // known phase.
+                        const auto dst_base_ptr = sym_buffer.map(
+                            buffer.landing_token_buffer.get_rank_buffer(sym_buffer.rank_idx)
+                                .get_data_buffer(token_idx).get_base_ptr(), r);
+                        {
+                            const auto src4 = static_cast<const int4*>(src_base_ptr);
+                            const auto dst4 = static_cast<int4*>(dst_base_ptr);
+                            constexpr uint32_t kNumPushInt4 = kHidden / sizeof(int4);
+                            DG_STATIC_ASSERT(kHidden % sizeof(int4) == 0, "Invalid hidden for vectorised push");
+                            #pragma unroll
+                            for (uint32_t c = lane_idx; c < kNumPushInt4; c += 32)
+                                dst4[c] = src4[c];
+                        }
+                        __syncwarp();
+
+                        // Scale factors
+                        const auto dst_sf_ptr = sym_buffer.map(
+                            buffer.landing_sf_buffer.get_rank_buffer(sym_buffer.rank_idx)
+                                .get_data_buffer(token_idx).template get_base_ptr<uint32_t>(), r);
+                        #pragma unroll
+                        for (uint32_t k = 0; k < math::constexpr_ceil_div(kNumPushSFUint32, 32u); ++ k) {
+                            const uint32_t j = k * 32 + lane_idx;
+                            if (j < kNumPushSFUint32)
+                                dst_sf_ptr[j] = src_sf_ptr[j];
+                        }
+
+                        // Top-k weights for this token
+                        const auto dst_weight_ptr = sym_buffer.map(
+                            buffer.landing_topk_weights_buffer.get_rank_buffer(sym_buffer.rank_idx)
+                                .get_data_buffer(token_idx).template get_base_ptr<float>(), r);
+                        if (lane_idx < kNumTopk)
+                            dst_weight_ptr[lane_idx] = src_weight_ptr[lane_idx];
+                        __syncwarp();
+
+                        // Publish: data -> system fence -> flag, all to the same peer
+                        __threadfence_system();
+                        if (cute::elect_one_sync()) {
+                            ptx::st_rel_sys(reinterpret_cast<int*>(sym_buffer.map(
+                                workspace.get_landing_ready_ptr(sym_buffer.rank_idx, token_idx), r)), 1);
+                        }
+                        __syncwarp();
+                    }
+                }
+            }
+        }
+
         // Grid sync
         comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
             workspace, sm_idx, thread_idx,
@@ -534,8 +633,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
             }
 
-            const auto src_base_ptr = sym_buffer.map(
-                buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
+            // Wait for the source rank's push to land in our landing buffer.
+            // NOTES: this is a local poll -- the payload was pushed to us, so nothing here
+            // reaches across the link.
+            if (cute::elect_one_sync()) {
+                const auto ready_ptr = reinterpret_cast<int*>(
+                    workspace.get_landing_ready_ptr(current_rank_in_expert_idx, src_token_idx));
+                while (ptx::ld_acq_sys(ready_ptr) == 0);
+            }
+            __syncwarp();
+
+            const auto src_base_ptr = buffer.landing_token_buffer
+                .get_rank_buffer(current_rank_in_expert_idx).get_data_buffer(src_token_idx).get_base_ptr();
             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
             const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
@@ -563,9 +672,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Load and store SF (overlaps with last chunk's TMA load from remote)
             constexpr uint32_t kNumSFUint32 = kHidden / 128;
             DG_STATIC_ASSERT(kNumSFUint32 > 0 and kHidden % 128 == 0, "Invalid SF");
-            const auto remote_sf_ptr = sym_buffer.map(
-                buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>(),
-                current_rank_in_expert_idx);
+            const auto remote_sf_ptr = buffer.landing_sf_buffer
+                .get_rank_buffer(current_rank_in_expert_idx)
+                .get_data_buffer(src_token_idx).template get_base_ptr<uint32_t>();
             const auto local_sf_ptr = buffer.l1_sf_buffer.get_base_ptr<uint32_t>();
             const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
             const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;
@@ -582,9 +691,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Store weights and metadata
             if (cute::elect_one_sync()) {
                 // Load weights
-                const auto weight = *sym_buffer.map(
-                    buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
-                    current_rank_in_expert_idx);
+                const auto weight = buffer.landing_topk_weights_buffer
+                    .get_rank_buffer(current_rank_in_expert_idx)
+                    .get_data_buffer(src_token_idx).template get_base_ptr<float>()[src_topk_idx];
                 *buffer.l1_topk_weights_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = weight;
 
                 // Write source metadata for combine write-back (logical pool token)
@@ -621,6 +730,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
             for (uint32_t i = thread_idx; i < workspace.num_shared_l2_pool_blocks; i += kNumDispatchThreads)
                 *workspace.get_shared_l2_full_count_ptr(i) = 0;
+            __syncwarp();
+
+            // Clear landing arrival flags so the next dispatch starts from "not arrived".
+            // NOTES: published by the workspace-clean barrier at the end of this branch.
+            for (uint32_t i = thread_idx; i < kNumRanks * workspace.num_max_tokens_per_rank; i += kNumDispatchThreads)
+                workspace.get_landing_ready_ptr()[i] = 0;
             __syncwarp();
         } else {
             // Other SMs: clean blocks

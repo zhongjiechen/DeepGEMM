@@ -125,6 +125,9 @@ struct Workspace {
         // Combine push source indices (full)
         num_bytes += num_max_pool_tokens * sizeof(TokenSrcMetadata);
 
+        // Landing buffer arrival flags, one per (source rank, source token)
+        num_bytes += num_ranks * num_max_tokens_per_rank * sizeof(uint32_t);
+
         // NOTES: every data buffer is chained off this workspace's end pointer and none of them
         // re-align, so the workspace's total size sets the alignment of the L1/L2/combine token
         // buffers -- the ~1400 GB/s TMA traffic. At the previous 16B alignment, adding or
@@ -260,6 +263,17 @@ struct Workspace {
         const auto base = reinterpret_cast<TokenSrcMetadata*>(get_src_token_topk_idx_ptr(num_experts_per_rank));
         return base + pool_token_idx;
     }
+
+    // Arrival flag for a token pushed into the landing buffer.
+    // NOTES: written by the source rank after its payload stores plus a system fence, and polled
+    // locally by the receiver. Gating the payload on a flag rather than on the pre-dispatch
+    // barrier is what keeps compute overlapping communication -- a barrier here would turn
+    // dispatch into a bulk phase.
+    CUTLASS_DEVICE
+    uint32_t* get_landing_ready_ptr(const uint32_t& src_rank_idx = 0, const uint32_t& token_idx = 0) const {
+        const auto base_ptr = reinterpret_cast<uint32_t*>(get_token_src_metadata_ptr(num_max_pool_tokens));
+        return base_ptr + src_rank_idx * num_max_tokens_per_rank + token_idx;
+    }
 };
 
 struct Data {
@@ -373,6 +387,17 @@ struct MegaMoEBuffer {
            l2_sf_buffer,
            combine_token_buffer;
 
+    // Dispatch landing buffers, indexed [source rank][source token index].
+    // NOTES: senders push here instead of receivers pulling from the sender's `input_*_buffer`.
+    // Indexing by the *source* token index means a token crosses the link once per destination
+    // rank however many of that rank's experts selected it -- the de-duplication falls out of
+    // the addressing rather than needing slot allocation. Capacity is therefore exactly
+    // `num_max_tokens_per_rank` per source, write-once/read-once within an iteration, so no
+    // credit flow control is needed.
+    Buffer landing_token_buffer,
+           landing_sf_buffer,
+           landing_topk_weights_buffer;
+
     CUTLASS_HOST_DEVICE
     MegaMoEBuffer(void* base,
                   const uint32_t& hidden,
@@ -456,11 +481,22 @@ struct MegaMoEBuffer {
         combine_token_buffer = Buffer(
             bf16_token_layout, num_topk + (num_shared_experts > 0 ? 1u : 0u), num_max_tokens_per_rank,
             with_sf ? l2_sf_buffer.get_end_ptr() : l2_token_buffer.get_end_ptr());
+
+        // Dispatch landing buffers, one slot per (source rank, source token)
+        landing_token_buffer = Buffer(
+            input_token_layout, num_ranks, num_max_tokens_per_rank,
+            combine_token_buffer.get_end_ptr());
+        landing_sf_buffer = Buffer(
+            input_sf_layout, num_ranks, num_max_tokens_per_rank,
+            landing_token_buffer.get_end_ptr());
+        landing_topk_weights_buffer = Buffer(
+            input_topk_weights_layout, num_ranks, num_max_tokens_per_rank,
+            with_sf ? landing_sf_buffer.get_end_ptr() : landing_token_buffer.get_end_ptr());
     }
 
     CUTLASS_HOST_DEVICE
     int64_t get_num_bytes() const {
-        return static_cast<uint8_t*>(combine_token_buffer.get_end_ptr())
+        return static_cast<uint8_t*>(landing_topk_weights_buffer.get_end_ptr())
                - static_cast<uint8_t*>(workspace.base);
     }
 };
