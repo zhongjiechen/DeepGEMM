@@ -15,7 +15,66 @@ Target topologies, in priority order:
 Cross-root-complex / cross-socket is out of scope for now, but the transport layer should
 degrade to a host-staged path rather than break.
 
-Test with **4 GPUs**.
+Test with **8 GPUs**.
+
+## What we are actually competing against
+
+**The baseline is not the NVLink number.** It is *this same PCIe-only machine running the
+unfused path* — DeepEP dispatch/combine plus separate GEMM kernels, which is what
+`tests/test_mega_moe.py` already benchmarks as `legacy` (currently inactive because `deep_ep`
+is not installed, hence the `0.00x legacy+shared` in every run).
+
+Both sides move their bytes over the same 51 GB/s link, so the PCIe bandwidth cost is *not* a
+regression — the baseline pays it too. Comparing a PCIe run against the 363 µs NVLink number is
+meaningless and led an earlier version of this document astray.
+
+What fusion actually buys on PCIe: the unfused path must finish all of dispatch before any GEMM
+starts, so its comm and compute **add**. The mega-kernel overlaps them, so it pays
+`max(comm, compute)`. With comm dominating that saves the whole compute time — about **12%**,
+and it is capped there.
+
+### The byte count decides the outcome, not the fusion
+
+12% is small enough that it is swamped by how many bytes each side puts on the wire, and here
+Mega MoE is currently at a **disadvantage**.
+
+Mega MoE sends per **(token, expert)**. `get_num_max_pool_tokens()` reserves
+`num_max_recv_tokens * min(num_topk, num_experts_per_rank)` slots, one per (token, local
+expert), and the dispatch pull fetches a full payload for each. A token selecting three experts
+on one destination rank crosses the link three times.
+
+DeepEP sends per **(token, destination rank)**. Its dispatch returns `num_recv_tokens` and
+`num_expanded_tokens` as *separate* quantities, and `do_expand` is documented as "one slot per
+expert per token" — a **layout**, applied after the transfer. If the wire carried per-expert
+copies the two counts would be identical. Combine takes `[num_tokens, hidden]` and has a
+"reduce epilogue", pointing to the same design mirrored (weaker evidence than the dispatch
+side).
+
+Expected remote copies per token, uniform expert selection:
+
+| config | Mega MoE | DeepEP | ratio |
+|---|---|---|---|
+| 4 ranks, 32 experts, topk 6 | 4.50 | 2.55 | **1.76x** |
+| **8 ranks, 32 experts, topk 6** | 5.25 | 4.09 | **1.28x** |
+| 16 ranks, topk 8 | 7.50 | 6.05 | 1.24x |
+| 64 ranks, topk 8 | ~7.9 | ~7.5 | ~1.05x |
+
+(`DeepEP = (R-1) * [1 - C(E-E/R, k)/C(E, k)]`, `Mega MoE = k * (R-1)/R`.)
+
+On a link that is bandwidth-saturated, moving 1.28x the bytes *is* 1.28x slower, and no amount
+of protocol cleanliness recovers it. Note the penalty is worst at small rank counts — upstream's
+per-expert design is entirely reasonable at large EP, where collisions are rare.
+
+**Consequence: dispatch dedup and combine pre-reduction are not optimisations, they are the
+difference between winning and losing this comparison.** They rank ahead of the landing buffer
+and push machinery. Conveniently the landing buffer *is* the dedup mechanism — see below.
+
+Two things that could move these numbers and are not yet measured:
+
+- DeepEP's own PCIe efficiency. Its intranode path is NVLink-tuned (fine-grained atomics, small
+  writes), so it may fall well short of 51 GB/s, which would shift the comparison back in our
+  favour. **This must be measured, not assumed.**
+- Routing skew. The table assumes uniform expert selection; real models do not route uniformly.
 
 ## Environment
 
@@ -293,8 +352,8 @@ so a passing run is a real correctness check, not just a smoke test.
 must be run twice:
 
 ```bash
-... tests/test_mega_moe.py --num-processes 4 --num-experts 32 --num-max-tokens-per-rank 1024
-... tests/test_mega_moe.py --num-processes 4 --num-experts 32 --num-max-tokens-per-rank 1024 --mma-type bf16xbf16
+... tests/test_mega_moe.py --num-processes 8 --num-experts 32 --num-max-tokens-per-rank 1024
+... tests/test_mega_moe.py --num-processes 8 --num-experts 32 --num-max-tokens-per-rank 1024 --mma-type bf16xbf16
 ```
 
 bf16xbf16 reference: `EP 0/4 | 1171 TFLOPS | 812 us`.
@@ -330,23 +389,28 @@ protocol change does not explain it, suspect this before anything else.
 
 ## Baseline (NVLink, what we are measured against)
 
-4 GPUs (0-3), `--num-experts 32 --num-max-tokens-per-rank 1024`, `mma_type=fp8xfp4`:
+**8 GPUs (0-7)**, `--num-experts 32 --num-max-tokens-per-rank 1024`, `mma_type=fp8xfp4`
+(4 experts per rank, topk 6):
 
 ```
-EP 0/4 | 2619 TFLOPS | overlap: 2739 TFLOPS, HBM 1430 GB/s, NVL 382 GB/s | 363 us, reduction 15.8 us
+EP 0/8 | 2522 TFLOPS | overlap: 2632 TFLOPS, HBM 1005 GB/s, NVL 368 GB/s | 379 us, reduction 15.8 us
 ```
 
-Reproduce with:
+Reproducible to 1 TFLOPS across runs. Reproduce with:
 
 ```bash
 PYTHONPATH=/home/zhongjiechen/DeepGEMM CUDA_HOME=/usr/local/cuda-13.1 \
-  PATH=/usr/local/cuda-13.1/bin:$PATH CUDA_VISIBLE_DEVICES=0,1,2,3 \
-  ~/zj_py/bin/python tests/test_mega_moe.py --num-processes 4 \
+  PATH=/usr/local/cuda-13.1/bin:$PATH CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  ~/zj_py/bin/python tests/test_mega_moe.py --num-processes 8 \
   --num-experts 32 --num-max-tokens-per-rank 1024
 ```
 
-Note the kernel sustains 382 GB/s of NVLink traffic. PCIe tops out at ~51 GB/s, so comm time
-alone rises by roughly 7.5x and stops hiding under compute.
+Earlier 4-GPU reference, for the commits that were measured against it:
+`EP 0/4 | 2619 TFLOPS | 363 us | NVL 382 GB/s` (and 2606 after the count all-gather).
+
+The kernel sustains 368 GB/s of cross-rank traffic over 379 µs — about **140 MB per rank per
+call**. At 51 GB/s that is ~2.7 ms of wire time, so on PCIe this kernel is comm-bound by roughly
+7x and compute hides entirely under communication rather than the reverse.
 
 ## Build
 
