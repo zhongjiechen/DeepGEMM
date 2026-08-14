@@ -372,21 +372,51 @@ against the **NVLink baseline** first, where iteration is fast and the reference
 Host-staging and PCIe measurement come *after* the protocol is PCIe-shaped, not before.
 
 
+## There is currently NO correctness signal
+
+`tests/test_mega_moe.py:380` gates the correctness block on `is_legacy_loaded`:
+
+```python
+if is_legacy_loaded and num_correctness_tests > 0:
+    ...
+    assert torch.equal(fused_stats, baseline_stats)
+    assert torch.equal(fused_y, baseline_y)   # or calc_diff < 1e-8 with shared experts
+else:
+    create_inputs()
+```
+
+`is_legacy_loaded` is False because `deep_ep` is not installed, so **a passing run proves only
+that the kernel launched without crashing and produced a throughput number. It does not check
+a single output value.** The `0.00x legacy+shared` in every result line is the tell.
+
+An earlier version of this document claimed the slot barrier and the count all-gather were
+validated by `torch.equal`. That was wrong — those runs never executed the assertions. Both
+changes are *plausible* (they reproduce baseline throughput, and a protocol that corrupted
+routing would likely hang or tank performance) but neither is verified.
+
+**Fix this before writing more protocol code.** Two options:
+
+1. Install `deep_ep` — gives the real baseline comparison too, which is separately needed to
+   know whether this port is winning. Requires NVSHMEM and a source build.
+2. Add a pure-torch reference MoE to the test and compare against it when `deep_ep` is absent.
+   Cheaper and has no dependencies: gather tokens per expert, two GEMMs with SwiGLU between,
+   weighted sum over topk. The test already builds all the inputs and weights it would need.
+
+Option 2 unblocks immediately; option 1 is needed eventually regardless.
+
 ## Progress
 
 | step | status | evidence |
 |---|---|---|
-| Per-rank slot barrier (replaces remote-atomic barrier) | **validated** | `EP 0/4 \| 2619 TFLOPS \| 363 us` — exact parity with baseline, `torch.equal` checks pass |
-| Count all-gather (drop `expert_recv_count_sum` atomic) | **validated** | `2606 TFLOPS \| 365 us`, −0.5% vs baseline; no remote atomics left in the kernel |
-| 8-GPU baseline established | **validated** | `EP 0/8 \| 2522 TFLOPS \| 379 us \| NVL 368 GB/s` |
-| Dispatch dedup + landing buffer + push | designed, **not implemented** | see the design section below; scaffolding was reverted rather than left half-written |
+| Per-rank slot barrier (replaces remote-atomic barrier) | runs, **not verified** | reproduces baseline throughput; no numerical check ran |
+| Count all-gather (drop `expert_recv_count_sum` atomic) | runs, **not verified** | `2606 TFLOPS` at 4 ranks, −0.5%; no numerical check ran |
+| Workspace 256 B end alignment | **measured** | throughput effect is a real measurement, independent of numerics |
+| 8-GPU baseline established | **measured** | `EP 0/8 \| 2522 TFLOPS \| 379 us \| NVL 368 GB/s` |
+| Dispatch dedup + landing buffer + push | **broken**, on branch `pcie-port-wip-push` | crashes with `cudaErrorIllegalInstruction`; see that branch's commit message for what is ruled out |
 | Combine pre-reduction | designed, not implemented | bigger byte win than dispatch dedup (~12% vs ~6% of total wire traffic) |
 | Split allocation (peer-visible vs local) | not started | |
 | Host-staged transport | not started | |
 | Combine write coalescing, finer chunking | not started | |
-
-The test asserts `torch.equal(fused_y, baseline_y)` and `torch.equal(fused_stats, baseline_stats)`,
-so a passing run is a real correctness check, not just a smoke test.
 
 **`--mma-type` defaults to `fp8xfp4`, so a default run does not touch
 `sm100_bf16_mega_moe.cuh` at all.** Both impls carry the same protocol code, so every change
